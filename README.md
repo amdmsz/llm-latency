@@ -66,7 +66,7 @@ The exit code is 0 only when every request succeeded, so the script can gate a d
 
 - **ttft**: seconds from sending the request to the first streamed content token. For reasoning models this includes thinking time, because that is what the user waits for. Pass `--count-reasoning` to stop the clock at the first reasoning token instead.
 - **total**: seconds from sending the request to the end of the stream.
-- **tok/s**: output tokens divided by generation time (`total - ttft`). Token counts come from the `usage` block when the server sends one. When it does not, tokens are estimated as characters / 4 and the column is prefixed with `~`.
+- **tok/s**: output tokens divided by generation time. Token counts come from the `usage` block when the server sends one. When it does not, tokens are estimated as characters / 4 and the column is prefixed with `~`. For reasoning models the count and the clock are matched: on OpenAI-style endpoints reasoning tokens are subtracted when the server reports them; on the Anthropic format, where hidden thinking is included in `output_tokens`, the clock starts at `message_start`. If an OpenAI-style server hides reasoning and does not report it separately, tok/s will read too high.
 - **success**: HTTP 2xx, at least one content token, and a proper end of stream. A stream that is cut off without `[DONE]` or `message_stop`, or that carries an error event, counts as a failure even though the status was 200.
 
 ## Reading the results honestly

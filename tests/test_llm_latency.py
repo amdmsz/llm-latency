@@ -45,6 +45,9 @@ class Mock(BaseHTTPRequestHandler):
         time.sleep(FIRST_DELAY)
         if self.path.endswith("/messages"):
             self._sse({"type": "message_start", "message": {"usage": {"output_tokens": 1}}}, event="message_start")
+            if model == "silent-thinker":
+                self._sse({"type": "content_block_start", "content_block": {"type": "thinking", "thinking": ""}})
+                time.sleep(0.2)
             if model == "thinker":
                 self._sse({"type": "content_block_delta", "delta": {"type": "thinking_delta", "thinking": "hmm"}})
                 time.sleep(0.2)
@@ -64,7 +67,9 @@ class Mock(BaseHTTPRequestHandler):
         for _ in range(CHUNKS):
             self._sse({"choices": [{"delta": {"content": "word "}}]})
             time.sleep(CHUNK_DELAY)
-        if model != "no-usage":
+        if model == "reasoner":
+            self._sse({"choices": [], "usage": {"completion_tokens": 1040, "completion_tokens_details": {"reasoning_tokens": 1000}}})
+        elif model != "no-usage":
             self._sse({"choices": [], "usage": {"completion_tokens": 40}})
         self._sse(raw=b"[DONE]")
 
@@ -124,6 +129,22 @@ class LatencyTests(unittest.TestCase):
         counted = self.req("thinker", api="anthropic", base=self.base, reasoning=True)
         self.assertGreaterEqual(visible.ttft, FIRST_DELAY + 0.2)
         self.assertLess(counted.ttft, visible.ttft - 0.1)
+
+    def test_hidden_reasoning_tokens_do_not_inflate_speed(self):
+        plain = self.req("m")
+        reasoner = self.req("reasoner")
+        self.assertEqual(reasoner.output_tokens, 1040)
+        self.assertLess(reasoner.tps, plain.tps * 1.5)
+
+    def test_streamed_thinking_starts_the_speed_clock(self):
+        r = self.req("thinker", api="anthropic", base=self.base)
+        visible_only = r.output_tokens / (r.total - r.ttft)
+        self.assertLess(r.tps, visible_only * 0.7)
+
+    def test_omitted_thinking_still_starts_the_speed_clock(self):
+        r = self.req("silent-thinker", api="anthropic", base=self.base)
+        self.assertGreaterEqual(r.ttft, FIRST_DELAY + 0.2)
+        self.assertLess(r.tps, r.output_tokens / (r.total - r.ttft) * 0.7)
 
     def test_http_error_is_a_failure(self):
         r = self.req("broken")

@@ -12,8 +12,11 @@ What is measured, per request, from the client:
   ttft     seconds from sending the request to the first streamed content token
            (for reasoning models this includes thinking time unless --count-reasoning is set)
   total    seconds from sending the request to the end of the stream
-  tps      output tokens / (total - ttft); tokens come from the usage block when the server
-           sends one, otherwise they are estimated from characters (marked with ~)
+  tps      output tokens / generation time. Tokens come from the usage block when the server
+           sends one, otherwise they are estimated from characters (marked with ~). For
+           reasoning models the clock and the token count are matched: either reasoning tokens
+           are subtracted (when the server reports them) or the clock starts at the first
+           streamed reasoning token
   ok       HTTP 2xx, at least one content token, and a clean end of stream
 """
 from __future__ import annotations
@@ -31,7 +34,7 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 DEFAULT_PROMPT = "Write a 200-word explanation of how a hash table handles collisions."
 
 
@@ -69,30 +72,39 @@ def build_request(api: str, base_url: str, model: str, prompt: str, max_tokens: 
 
 
 def parse_event(api: str, data: dict, count_reasoning: bool):
-    """Return (content_text, output_tokens_or_None, error_or_None) for one SSE data object."""
+    """Return (content_text, output_tokens_or_None, error_or_None, reasoning_seen, reasoning_tokens_or_None)."""
     if api == "anthropic":
         t = data.get("type")
         if t == "error":
-            return "", None, json.dumps(data.get("error", data))[:200]
+            return "", None, json.dumps(data.get("error", data))[:200], False, None
         if t == "content_block_delta":
             d = data.get("delta", {})
             if d.get("type") == "text_delta":
-                return d.get("text", ""), None, None
-            if count_reasoning and d.get("type") == "thinking_delta":
-                return d.get("thinking", ""), None, None
+                return d.get("text", ""), None, None, False, None
+            if d.get("type") in ("thinking_delta", "signature_delta"):
+                return (d.get("thinking", "") if count_reasoning else ""), None, None, True, None
+        if t == "message_start" or (t == "content_block_start"
+                                    and (data.get("content_block") or {}).get("type") in ("thinking", "redacted_thinking")):
+            # Generation starts at message_start. Thinking can be hidden entirely while its tokens are
+            # still counted in output_tokens, so the speed clock starts here, not at the first visible token.
+            return "", None, None, True, None
         if t == "message_delta":
-            return "", (data.get("usage") or {}).get("output_tokens"), None
-        return "", None, None
+            return "", (data.get("usage") or {}).get("output_tokens"), None, False, None
+        return "", None, None, False, None
     if data.get("error"):
-        return "", None, json.dumps(data["error"])[:200]
-    text = ""
+        return "", None, json.dumps(data["error"])[:200], False, None
+    text, reasoning = "", False
     for ch in data.get("choices") or []:
         d = ch.get("delta") or {}
         text += d.get("content") or ""
-        if count_reasoning:
-            text += d.get("reasoning_content") or d.get("reasoning") or ""
+        r = d.get("reasoning_content") or d.get("reasoning") or ""
+        if r:
+            reasoning = True
+            if count_reasoning:
+                text += r
     usage = data.get("usage") or {}
-    return text, usage.get("completion_tokens"), None
+    details = usage.get("completion_tokens_details") or {}
+    return text, usage.get("completion_tokens"), None, reasoning, details.get("reasoning_tokens")
 
 
 def one_request(api, base_url, model, prompt, max_tokens, key, timeout, count_reasoning, insecure=False) -> Result:
@@ -115,6 +127,7 @@ def one_request(api, base_url, model, prompt, max_tokens, key, timeout, count_re
             r.error = resp.read(400).decode("utf-8", "replace").replace("\n", " ")
             return r
         chars, done = 0, False
+        first_any, reasoning_tokens = None, None
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data:"):
@@ -127,10 +140,14 @@ def one_request(api, base_url, model, prompt, max_tokens, key, timeout, count_re
                 data = json.loads(payload)
             except ValueError:
                 continue
-            text, tokens, err = parse_event(api, data, count_reasoning)
+            text, tokens, err, reasoning, rtok = parse_event(api, data, count_reasoning)
             if err:
                 r.error = err
                 break
+            if (text or reasoning) and first_any is None:
+                first_any = time.perf_counter() - t0
+            if rtok is not None:
+                reasoning_tokens = rtok
             if text:
                 if r.ttft is None:
                     r.ttft = time.perf_counter() - t0
@@ -151,8 +168,16 @@ def one_request(api, base_url, model, prompt, max_tokens, key, timeout, count_re
             return r
         if r.output_tokens is None:
             r.output_tokens, r.tokens_estimated = max(1, round(chars / 4)), True
-        gen = r.total - r.ttft
-        r.tps = r.output_tokens / gen if gen > 0.05 else None
+        # Match the token count to the clock. If the server reports reasoning tokens, count only
+        # visible tokens over the visible stream; otherwise, if reasoning was streamed, start the
+        # clock at the first reasoning token so hidden-then-visible output is not overstated.
+        speed_tokens, start = r.output_tokens, r.ttft
+        if reasoning_tokens and not count_reasoning and not r.tokens_estimated:
+            speed_tokens = max(0, r.output_tokens - reasoning_tokens)
+        elif first_any is not None and not r.tokens_estimated:
+            start = first_any
+        gen = r.total - start
+        r.tps = speed_tokens / gen if gen > 0.05 and speed_tokens > 0 else None
         r.ok = True
         return r
     except Exception as e:  # timeouts, resets, TLS errors: all count as failures
