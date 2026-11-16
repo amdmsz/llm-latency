@@ -146,6 +146,17 @@ class LatencyTests(unittest.TestCase):
         self.assertGreaterEqual(r.ttft, FIRST_DELAY + 0.2)
         self.assertLess(r.tps, r.output_tokens / (r.total - r.ttft) * 0.7)
 
+    def test_tps_basis_is_recorded(self):
+        self.assertEqual(self.req("m").tps_basis, "no_reasoning_info")
+        self.assertEqual(self.req("reasoner").tps_basis, "visible")
+        self.assertEqual(self.req("no-usage").tps_basis, "estimated")
+        for model in ("claude", "thinker", "silent-thinker"):
+            self.assertEqual(self.req(model, api="anthropic", base=self.base).tps_basis, "all_output")
+
+    def test_mixed_tps_basis_is_visible_in_summary(self):
+        s = L.summarize([self.req("m"), self.req("reasoner")])
+        self.assertEqual(s["tps_basis"], "no_reasoning_info+visible")
+
     def test_http_error_is_a_failure(self):
         r = self.req("broken")
         self.assertFalse(r.ok)

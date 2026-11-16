@@ -16,7 +16,7 @@ What is measured, per request, from the client:
            sends one, otherwise they are estimated from characters (marked with ~). For
            reasoning models the clock and the token count are matched: either reasoning tokens
            are subtracted (when the server reports them) or the clock starts at the first
-           streamed reasoning token
+           streamed reasoning token. Each result records which of these was used in tps_basis
   ok       HTTP 2xx, at least one content token, and a clean end of stream
 """
 from __future__ import annotations
@@ -34,7 +34,7 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 from urllib.parse import urlparse
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 DEFAULT_PROMPT = "Write a 200-word explanation of how a hash table handles collisions."
 
 
@@ -48,6 +48,13 @@ class Result:
     output_tokens: Optional[int] = None
     tokens_estimated: bool = False
     tps: Optional[float] = None
+    # What tps measures. Rows with different bases are not directly comparable.
+    #   visible            visible tokens / visible stream (reported reasoning tokens subtracted)
+    #   all_output         all output tokens, reasoning included / time from generation start
+    #   no_reasoning_info  no reasoning signal at all: right for non-reasoning models, too high if
+    #                      the server hides reasoning and does not report reasoning tokens
+    #   estimated          tokens estimated from streamed characters
+    tps_basis: str = ""
     error: str = ""
 
 
@@ -127,7 +134,7 @@ def one_request(api, base_url, model, prompt, max_tokens, key, timeout, count_re
             r.error = resp.read(400).decode("utf-8", "replace").replace("\n", " ")
             return r
         chars, done = 0, False
-        first_any, reasoning_tokens = None, None
+        first_any, reasoning_tokens, reasoning_seen = None, None, False
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("data:"):
@@ -144,6 +151,7 @@ def one_request(api, base_url, model, prompt, max_tokens, key, timeout, count_re
             if err:
                 r.error = err
                 break
+            reasoning_seen = reasoning_seen or reasoning
             if (text or reasoning) and first_any is None:
                 first_any = time.perf_counter() - t0
             if rtok is not None:
@@ -172,10 +180,16 @@ def one_request(api, base_url, model, prompt, max_tokens, key, timeout, count_re
         # visible tokens over the visible stream; otherwise, if reasoning was streamed, start the
         # clock at the first reasoning token so hidden-then-visible output is not overstated.
         speed_tokens, start = r.output_tokens, r.ttft
-        if reasoning_tokens and not count_reasoning and not r.tokens_estimated:
+        if r.tokens_estimated:
+            r.tps_basis = "estimated"
+        elif reasoning_tokens and not count_reasoning:
             speed_tokens = max(0, r.output_tokens - reasoning_tokens)
-        elif first_any is not None and not r.tokens_estimated:
+            r.tps_basis = "visible"
+        elif reasoning_seen or reasoning_tokens:
             start = first_any
+            r.tps_basis = "all_output"
+        else:
+            r.tps_basis = "no_reasoning_info"
         gen = r.total - start
         r.tps = speed_tokens / gen if gen > 0.05 and speed_tokens > 0 else None
         r.ok = True
@@ -217,6 +231,7 @@ def summarize(results):
         "total_p50_s": q(total, 0.5), "total_p95_s": q(total, 0.95),
         "tps_p50": None if not tps else round(quantile(tps, 0.5), 1),
         "tokens_estimated": any(r.tokens_estimated for r in ok),
+        "tps_basis": "+".join(sorted({r.tps_basis for r in ok if r.tps_basis})) or None,
         "errors": sorted({(r.error or f"HTTP {r.status}")[:80] for r in results if not r.ok}),
     }
 
@@ -240,13 +255,13 @@ def fmt(v, suffix=""):
 
 
 def print_table(rows, out=sys.stdout):
-    head = ["model", "n", "success", "ttft p50", "ttft p95", "total p50", "total p95", "tok/s p50"]
+    head = ["model", "n", "success", "ttft p50", "ttft p95", "total p50", "total p95", "tok/s p50", "tok/s basis"]
     table = [head]
     for s in rows:
         table.append([s["model"], str(s["requests"]), fmt(s["success_rate"], "%"),
                       fmt(s["ttft_p50_s"], " s"), fmt(s["ttft_p95_s"], " s"),
                       fmt(s["total_p50_s"], " s"), fmt(s["total_p95_s"], " s"),
-                      ("~" if s["tokens_estimated"] else "") + fmt(s["tps_p50"])])
+                      ("~" if s["tokens_estimated"] else "") + fmt(s["tps_p50"]), fmt(s["tps_basis"])])
     widths = [max(len(r[i]) for r in table) for i in range(len(head))]
     for i, r in enumerate(table):
         print("  ".join(c.ljust(widths[j]) if j == 0 else c.rjust(widths[j]) for j, c in enumerate(r)), file=out)

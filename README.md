@@ -67,6 +67,13 @@ The exit code is 0 only when every request succeeded, so the script can gate a d
 - **ttft**: seconds from sending the request to the first streamed content token. For reasoning models this includes thinking time, because that is what the user waits for. Pass `--count-reasoning` to stop the clock at the first reasoning token instead.
 - **total**: seconds from sending the request to the end of the stream.
 - **tok/s**: output tokens divided by generation time. Token counts come from the `usage` block when the server sends one. When it does not, tokens are estimated as characters / 4 and the column is prefixed with `~`. For reasoning models the count and the clock are matched: on OpenAI-style endpoints reasoning tokens are subtracted when the server reports them; on the Anthropic format, where hidden thinking is included in `output_tokens`, the clock starts at `message_start`. If an OpenAI-style server hides reasoning and does not report it separately, tok/s will read too high.
+- **tok/s basis**: because of this, tok/s does not always measure the same thing. Each result in `--json` / `--csv` has a `tps_basis` field, and the table shows it per model:
+  - `visible`: visible tokens over the visible stream (reported reasoning tokens subtracted)
+  - `all_output`: all output tokens, thinking included, over the time from generation start (Anthropic format, or streamed reasoning)
+  - `no_reasoning_info`: the server sent no reasoning signal. Right for non-reasoning models; too high if the server hides reasoning without reporting it
+  - `estimated`: tokens estimated from characters
+
+  Only compare tok/s between rows with the same basis. A value such as `no_reasoning_info+visible` means the runs for that model did not all use the same basis.
 - **success**: HTTP 2xx, at least one content token, and a proper end of stream. A stream that is cut off without `[DONE]` or `message_stop`, or that carries an error event, counts as a failure even though the status was 200.
 
 ## Reading the results honestly
